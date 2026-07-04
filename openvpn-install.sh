@@ -176,13 +176,21 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	else
 		fallback="y"
 	fi
-	# Also deploy a UDP 443 fallback instance (looks like QUIC / HTTP-3 to DPI)
-	# Many networks that block UDP 1194 still pass UDP 443, and it keeps UDP speed
+	# Also deploy a UDP 443 fallback instance. Many networks that block UDP 1194
+	# (or all non-443 UDP) still pass UDP 443, and it keeps UDP's speed on links
+	# where the TCP 443 fallback would be slower. This shares only the port number
+	# with QUIC/HTTP-3; the packets are still recognizably OpenVPN to DPI, so it
+	# buys reachability, not disguise.
 	# Skipped only when the primary instance is already UDP 443
 	if [[ "$protocol" = "udp" && "$port" = 443 ]]; then
 		fallback_udp=""
 	else
 		fallback_udp="y"
+	fi
+	# Any OpenVPN instance that ends up on TCP 443 gets a TLS decoy behind
+	# port-share, whether 443 is the primary port or the TCP fallback
+	if [[ ( "$protocol" = "tcp" && "$port" = 443 ) || -n "$fallback" ]]; then
+		tcp443="y"
 	fi
 	if [[ -n "$fallback" || -n "$fallback_udp" ]]; then
 		echo
@@ -251,7 +259,7 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	read -n1 -r -p "Press any key to continue..."
 	# A lightweight web server backs the TCP 443 port-share decoy
 	# Active probes or browsers hitting 443 get a real site instead of silence
-	[[ -n "$fallback" ]] && webserver="nginx"
+	[[ -n "$tcp443" ]] && webserver="nginx"
 	# If running inside a container, disable LimitNPROC to prevent conflicts
 	if systemd-detect-virt -cq; then
 		# Template-wide drop-in so it also covers the TCP fallback instance
@@ -412,10 +420,43 @@ push "rcvbuf 524288"' >> /etc/openvpn/server/server.conf
 	# options, but with its own subnet and without the UDP-only options
 	if [[ -n "$fallback" ]]; then
 		sed 's|^port .*|port 443|; s|^proto .*|proto tcp|; s|^server 10\.8\.0\.0 .*|server 10.8.1.0 255.255.255.0|; s|fddd:1194:1194:1194::|fddd:1195:1195:1195::|g; s|^ifconfig-pool-persist ipp\.txt|ifconfig-pool-persist ipp-tcp.txt|; s|status-server\.log|status-server-tcp.log|' /etc/openvpn/server/server.conf | grep -vE '^(explicit-exit-notify|fast-io|sndbuf|rcvbuf)|^push "(snd|rcv)buf' > /etc/openvpn/server/server-tcp.conf
-		# Set up a decoy website on loopback. OpenVPN's port-share forwards any
-		# connection on 443 that is not a valid OpenVPN handshake to this server,
-		# so active probes and browsers see a real site instead of silence.
-		# This only defeats active probing; it does not obfuscate the VPN stream.
+	fi
+	# Create the UDP 443 fallback instance, reusing the same PKI, DNS and routing
+	# options but on its own subnet (reachability on networks that pass UDP 443)
+	if [[ -n "$fallback_udp" ]]; then
+		sed 's|^port .*|port 443|; s|^proto .*|proto udp|; s|^server 10\.8\.0\.0 .*|server 10.8.2.0 255.255.255.0|; s|fddd:1194:1194:1194::|fddd:1196:1196:1196::|g; s|^ifconfig-pool-persist ipp\.txt|ifconfig-pool-persist ipp-udp.txt|; s|status-server\.log|status-server-udp.log|' /etc/openvpn/server/server.conf > /etc/openvpn/server/server-udp.conf
+		# When the primary is TCP, the UDP tuning block is absent, so add it here
+		if ! grep -q '^explicit-exit-notify' /etc/openvpn/server/server-udp.conf; then
+			echo 'explicit-exit-notify
+fast-io
+sndbuf 524288
+rcvbuf 524288
+push "sndbuf 524288"
+push "rcvbuf 524288"' >> /etc/openvpn/server/server-udp.conf
+		fi
+	fi
+	# Whenever an instance listens on TCP 443, stand up a TLS decoy behind
+	# OpenVPN's port-share. Any connection on 443 that is not a valid OpenVPN
+	# handshake (an active probe or a browser) is forwarded to a real HTTPS
+	# site, so 443 completes a normal TLS handshake instead of returning
+	# silence or the tell-tale "443 that does not speak TLS" anomaly.
+	# This only defeats active probing; it does not obfuscate the VPN stream.
+	# Runs after the UDP fallback is derived so port-share is never inherited by
+	# the UDP instance (port-share is TCP-only and would break it).
+	if [[ -n "$tcp443" ]]; then
+		# The TCP 443 instance is the fallback when one exists, otherwise the
+		# primary server was itself configured on TCP 443
+		if [[ -n "$fallback" ]]; then
+			tcp443_conf=/etc/openvpn/server/server-tcp.conf
+		else
+			tcp443_conf=/etc/openvpn/server/server.conf
+		fi
+		# Self-signed cert so the decoy can terminate TLS. nginx reads the key
+		# as root at startup, so it can stay chmod 600. Kept under the server
+		# dir so it is removed with everything else on uninstall.
+		mkdir -p /etc/openvpn/server/decoy
+		openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes -keyout /etc/openvpn/server/decoy/decoy.key -out /etc/openvpn/server/decoy/decoy.crt -subj "/CN=localhost" 2>/dev/null
+		chmod 600 /etc/openvpn/server/decoy/decoy.key 2>/dev/null
 		mkdir -p /var/www/openvpn-decoy
 		echo '<!DOCTYPE html>
 <html lang="en">
@@ -431,7 +472,26 @@ push "rcvbuf 524288"' >> /etc/openvpn/server/server.conf
 </body>
 </html>' > /var/www/openvpn-decoy/index.html
 		mkdir -p /etc/nginx/conf.d
-		echo 'server {
+		if [[ -s /etc/openvpn/server/decoy/decoy.crt && -s /etc/openvpn/server/decoy/decoy.key ]]; then
+			# TLS decoy: an HTTPS probe to 443 completes a normal handshake and
+			# gets a real page, killing the "443 that does not speak TLS" tell
+			echo 'server {
+    listen 127.0.0.1:8080 ssl;
+    server_name _;
+    ssl_certificate /etc/openvpn/server/decoy/decoy.crt;
+    ssl_certificate_key /etc/openvpn/server/decoy/decoy.key;
+    root /var/www/openvpn-decoy;
+    index index.html;
+    # Serve the page even to a plain-HTTP request that lands on the TLS port
+    error_page 497 =200 /index.html;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}' > /etc/nginx/conf.d/openvpn-decoy.conf
+		else
+			# Cert generation failed for some reason: keep a plain-HTTP decoy so
+			# the port-share backend is still alive (a refused 443 is worse)
+			echo 'server {
     listen 127.0.0.1:8080;
     server_name _;
     root /var/www/openvpn-decoy;
@@ -440,24 +500,11 @@ push "rcvbuf 524288"' >> /etc/openvpn/server/server.conf
         try_files $uri $uri/ =404;
     }
 }' > /etc/nginx/conf.d/openvpn-decoy.conf
+		fi
 		systemctl enable --now nginx 2>/dev/null
 		systemctl reload nginx 2>/dev/null || systemctl restart nginx
-		# Hand non-OpenVPN traffic on 443 to the local decoy web server
-		echo 'port-share 127.0.0.1 8080' >> /etc/openvpn/server/server-tcp.conf
-	fi
-	# Create the UDP 443 fallback instance (QUIC-like camouflage), reusing the same
-	# PKI, DNS and routing options but on its own subnet
-	if [[ -n "$fallback_udp" ]]; then
-		sed 's|^port .*|port 443|; s|^proto .*|proto udp|; s|^server 10\.8\.0\.0 .*|server 10.8.2.0 255.255.255.0|; s|fddd:1194:1194:1194::|fddd:1196:1196:1196::|g; s|^ifconfig-pool-persist ipp\.txt|ifconfig-pool-persist ipp-udp.txt|; s|status-server\.log|status-server-udp.log|' /etc/openvpn/server/server.conf > /etc/openvpn/server/server-udp.conf
-		# When the primary is TCP, the UDP tuning block is absent, so add it here
-		if ! grep -q '^explicit-exit-notify' /etc/openvpn/server/server-udp.conf; then
-			echo 'explicit-exit-notify
-fast-io
-sndbuf 524288
-rcvbuf 524288
-push "sndbuf 524288"
-push "rcvbuf 524288"' >> /etc/openvpn/server/server-udp.conf
-		fi
+		# Hand non-OpenVPN traffic on 443 to the local TLS decoy
+		echo 'port-share 127.0.0.1 8080' >> "$tcp443_conf"
 	fi
 	# Enable net.ipv4.ip_forward for the system
 	echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-openvpn-forward.conf
@@ -605,7 +652,10 @@ WantedBy=multi-user.target" >> /etc/systemd/system/openvpn-iptables.service
 		if [[ -n "$fallback" ]]; then
 			# 443 belongs to http_port_t in the base policy, so modify it
 			semanage port -a -t openvpn_port_t -p tcp 443 2>/dev/null || semanage port -m -t openvpn_port_t -p tcp 443
+		fi
+		if [[ -n "$tcp443" ]]; then
 			# Allow OpenVPN to open the loopback connection to the port-share decoy
+			# (needed whether 443 is the primary port or the TCP fallback)
 			setsebool -P openvpn_can_network_connect 1
 		fi
 		if [[ -n "$fallback_udp" ]]; then
@@ -619,7 +669,7 @@ WantedBy=multi-user.target" >> /etc/systemd/system/openvpn-iptables.service
 dev tun
 remote $ip $port $protocol" > /etc/openvpn/server/client-common.txt
 	if [[ -n "$fallback_udp" ]]; then
-		# UDP 443 fallback (QUIC-like), tried before TCP for better speed
+		# UDP 443 fallback, tried before TCP because UDP is faster
 		echo "remote $ip 443 udp" >> /etc/openvpn/server/client-common.txt
 	fi
 	if [[ -n "$fallback" ]]; then
