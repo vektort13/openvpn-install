@@ -166,6 +166,17 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 		read -p "Port [1194]: " port
 	done
 	[[ -z "$port" ]] && port="1194"
+	# Always deploy a TCP 443 fallback instance alongside the primary one
+	# Restrictive networks often block UDP, but rarely block TCP on port 443
+	# Skipped only when the primary instance is already TCP 443
+	if [[ "$protocol" = "tcp" && "$port" = 443 ]]; then
+		fallback=""
+	else
+		fallback="y"
+		echo
+		echo "A TCP 443 fallback instance will also be set up. Clients will use $protocol $port"
+		echo "and switch to TCP 443 automatically on networks where it is blocked."
+	fi
 	echo
 	echo "Select a DNS server for the clients:"
 	echo "   1) Default system resolvers"
@@ -225,21 +236,25 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 		fi
 	fi
 	read -n1 -r -p "Press any key to continue..."
+	# A lightweight web server backs the TCP 443 port-share decoy
+	# Active probes or browsers hitting 443 get a real site instead of silence
+	[[ -n "$fallback" ]] && webserver="nginx"
 	# If running inside a container, disable LimitNPROC to prevent conflicts
 	if systemd-detect-virt -cq; then
-		mkdir /etc/systemd/system/openvpn-server@server.service.d/ 2>/dev/null
+		# Template-wide drop-in so it also covers the TCP fallback instance
+		mkdir /etc/systemd/system/openvpn-server@.service.d/ 2>/dev/null
 		echo "[Service]
-LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
+LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@.service.d/disable-limitnproc.conf
 	fi
 	if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
 		apt-get update
-		apt-get install -y --no-install-recommends openvpn openssl ca-certificates $firewall
+		apt-get install -y --no-install-recommends openvpn openssl ca-certificates $firewall $webserver
 	elif [[ "$os" = "centos" ]]; then
 		dnf install -y epel-release
-		dnf install -y openvpn openssl ca-certificates tar $firewall
+		dnf install -y openvpn openssl ca-certificates tar $firewall $webserver
 	else
 		# Else, OS must be Fedora
-		dnf install -y openvpn openssl ca-certificates tar $firewall
+		dnf install -y openvpn openssl ca-certificates tar $firewall $webserver
 	fi
 	# If firewalld was just installed, enable it
 	if [[ "$firewall" == "firewalld" ]]; then
@@ -247,14 +262,23 @@ LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@server.service.d/disab
 	fi
 	# Get easy-rsa
 	easy_rsa_url='https://github.com/OpenVPN/easy-rsa/releases/download/v3.2.6/EasyRSA-3.2.6.tgz'
+	# Official SHA256 of EasyRSA-3.2.6.tgz, used to protect against tampered downloads
+	easy_rsa_sha256='c2572990ce91112eef8d1b8e4a3b58790da95b68501785c621f69121dfbd22d7'
+	easy_rsa_tgz=$(mktemp)
+	wget -qO "$easy_rsa_tgz" "$easy_rsa_url" 2>/dev/null || curl -sLo "$easy_rsa_tgz" "$easy_rsa_url"
+	if ! echo "$easy_rsa_sha256  $easy_rsa_tgz" | sha256sum -c --status; then
+		rm -f "$easy_rsa_tgz"
+		echo "easy-rsa download failed the integrity check. Aborting installation."
+		exit 1
+	fi
 	mkdir -p /etc/openvpn/server/easy-rsa/
-	{ wget -qO- "$easy_rsa_url" 2>/dev/null || curl -sL "$easy_rsa_url" ; } | tar xz -C /etc/openvpn/server/easy-rsa/ --strip-components 1
+	tar xzf "$easy_rsa_tgz" -C /etc/openvpn/server/easy-rsa/ --strip-components 1
+	rm -f "$easy_rsa_tgz"
 	chown -R root:root /etc/openvpn/server/easy-rsa/
 	cd /etc/openvpn/server/easy-rsa/
-	# Create the PKI, set up the CA and create TLS key
+	# Create the PKI and set up the CA
 	./easyrsa --batch init-pki
 	./easyrsa --batch build-ca nopass
-	./easyrsa gen-tls-crypt-key
 	# Create the DH parameters file using the predefined ffdhe2048 group
 	echo '-----BEGIN DH PARAMETERS-----
 MIIBCAKCAQEA//////////+t+FRYortKmq/cViAnPTzx2LnFg84tNpWp4TZBFGQz
@@ -267,12 +291,18 @@ ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 	# Make easy-rsa aware of our external DH file (prevents a warning)
 	ln -s /etc/openvpn/server/dh.pem pki/dh.pem
 	# Create certificates and CRL
+	# Server certificate is long-lived, client certificates expire after 3 years
 	./easyrsa --batch --days=3650 build-server-full server nopass
-	./easyrsa --batch --days=3650 build-client-full "$client" nopass
+	./easyrsa --batch --days=1095 build-client-full "$client" nopass
 	./easyrsa --batch --days=3650 gen-crl
 	# Move the stuff we need
 	cp pki/ca.crt pki/private/ca.key pki/issued/server.crt pki/private/server.key pki/crl.pem /etc/openvpn/server
-	cp pki/private/easyrsa-tls.key /etc/openvpn/server/tc.key
+	# Create the tls-crypt-v2 server key and an individual key for the first client
+	# Unlike tls-crypt v1, a leaked client config does not expose a key shared by everyone
+	openvpn --genkey tls-crypt-v2-server /etc/openvpn/server/tc-v2.key
+	openvpn --tls-crypt-v2 /etc/openvpn/server/tc-v2.key --genkey tls-crypt-v2-client pki/private/"$client".tc-v2.key
+	# Ensure key material is only readable by root
+	chmod 600 /etc/openvpn/server/ca.key /etc/openvpn/server/server.key /etc/openvpn/server/tc-v2.key
 	# CRL is read with each client connection, while OpenVPN is dropped to nobody
 	chown nobody:"$group_name" /etc/openvpn/server/crl.pem
 	# Without +x in the directory, OpenVPN can't run a stat() on the CRL file
@@ -287,7 +317,10 @@ cert server.crt
 key server.key
 dh dh.pem
 auth SHA512
-tls-crypt tc.key
+tls-crypt-v2 tc-v2.key
+tls-version-min 1.3
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+mssfix 1420
 topology subnet
 server 10.8.0.0 255.255.255.0" > /etc/openvpn/server/server.conf
 	# IPv6
@@ -350,9 +383,54 @@ group $group_name
 persist-key
 persist-tun
 verb 3
+status /run/openvpn-server/status-server.log
+status-version 2
 crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 	if [[ "$protocol" = "udp" ]]; then
-		echo "explicit-exit-notify" >> /etc/openvpn/server/server.conf
+		# UDP tuning: larger socket buffers and reduced syscall overhead
+		echo 'explicit-exit-notify
+fast-io
+sndbuf 524288
+rcvbuf 524288
+push "sndbuf 524288"
+push "rcvbuf 524288"' >> /etc/openvpn/server/server.conf
+	fi
+	# Create the TCP 443 fallback instance, reusing the same PKI, DNS and routing
+	# options, but with its own subnet and without the UDP-only options
+	if [[ -n "$fallback" ]]; then
+		sed 's|^port .*|port 443|; s|^proto .*|proto tcp|; s|^server 10\.8\.0\.0 .*|server 10.8.1.0 255.255.255.0|; s|fddd:1194:1194:1194::|fddd:1195:1195:1195::|g; s|^ifconfig-pool-persist ipp\.txt|ifconfig-pool-persist ipp-tcp.txt|; s|status-server\.log|status-server-tcp.log|' /etc/openvpn/server/server.conf | grep -vE '^(explicit-exit-notify|fast-io|sndbuf|rcvbuf)|^push "(snd|rcv)buf' > /etc/openvpn/server/server-tcp.conf
+		# Set up a decoy website on loopback. OpenVPN's port-share forwards any
+		# connection on 443 that is not a valid OpenVPN handshake to this server,
+		# so active probes and browsers see a real site instead of silence.
+		# This only defeats active probing; it does not obfuscate the VPN stream.
+		mkdir -p /var/www/openvpn-decoy
+		echo '<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome</title>
+<style>body{font-family:sans-serif;margin:3em auto;max-width:40em;padding:0 1em;color:#333}</style>
+</head>
+<body>
+<h1>It works!</h1>
+<p>This is the default landing page for this server. If you are the site administrator, replace this file to publish your own content.</p>
+</body>
+</html>' > /var/www/openvpn-decoy/index.html
+		mkdir -p /etc/nginx/conf.d
+		echo 'server {
+    listen 127.0.0.1:8080;
+    server_name _;
+    root /var/www/openvpn-decoy;
+    index index.html;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}' > /etc/nginx/conf.d/openvpn-decoy.conf
+		systemctl enable --now nginx 2>/dev/null
+		systemctl reload nginx 2>/dev/null || systemctl restart nginx
+		# Hand non-OpenVPN traffic on 443 to the local decoy web server
+		echo 'port-share 127.0.0.1 8080' >> /etc/openvpn/server/server-tcp.conf
 	fi
 	# Enable net.ipv4.ip_forward for the system
 	echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-openvpn-forward.conf
@@ -363,6 +441,19 @@ crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 		echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-openvpn-forward.conf
 		# Enable without waiting for a reboot or service restart
 		echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+	fi
+	# Raise socket buffer limits so the sndbuf/rcvbuf values above take effect
+	echo 'net.core.rmem_max=4194304
+net.core.wmem_max=4194304' >> /etc/sysctl.d/99-openvpn-forward.conf
+	echo 4194304 > /proc/sys/net/core/rmem_max
+	echo 4194304 > /proc/sys/net/core/wmem_max
+	# Enable BBR congestion control if the kernel supports it
+	# Helps the TCP fallback and server-side traffic on lossy links
+	if modprobe tcp_bbr 2>/dev/null && grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
+		echo 'net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.d/99-openvpn-forward.conf
+		echo fq > /proc/sys/net/core/default_qdisc
+		echo bbr > /proc/sys/net/ipv4/tcp_congestion_control
 	fi
 	if systemctl is-active --quiet firewalld.service; then
 		# Using both permanent and not permanent rules to avoid a firewalld
@@ -381,6 +472,20 @@ crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 			firewall-cmd --permanent --zone=trusted --add-source=fddd:1194:1194:1194::/64
 			firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
 			firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+		fi
+		if [[ -n "$fallback" ]]; then
+			firewall-cmd --add-port=443/tcp
+			firewall-cmd --zone=trusted --add-source=10.8.1.0/24
+			firewall-cmd --permanent --add-port=443/tcp
+			firewall-cmd --permanent --zone=trusted --add-source=10.8.1.0/24
+			firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.1.0/24 ! -d 10.8.1.0/24 -j SNAT --to "$ip"
+			firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.1.0/24 ! -d 10.8.1.0/24 -j SNAT --to "$ip"
+			if [[ -n "$ip6" ]]; then
+				firewall-cmd --zone=trusted --add-source=fddd:1195:1195:1195::/64
+				firewall-cmd --permanent --zone=trusted --add-source=fddd:1195:1195:1195::/64
+				firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1195:1195:1195::/64 ! -d fddd:1195:1195:1195::/64 -j SNAT --to "$ip6"
+				firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1195:1195:1195::/64 ! -d fddd:1195:1195:1195::/64 -j SNAT --to "$ip6"
+			fi
 		fi
 	else
 		# Create a service to set up persistent iptables rules
@@ -413,42 +518,111 @@ ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:1194:1194:1194::/64 
 ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
 ExecStop=$ip6tables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
 		fi
+		if [[ -n "$fallback" ]]; then
+			echo "ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s 10.8.1.0/24 ! -d 10.8.1.0/24 -j SNAT --to $ip
+ExecStart=$iptables_path -w 5 -I INPUT -p tcp --dport 443 -j ACCEPT
+ExecStart=$iptables_path -w 5 -I FORWARD -s 10.8.1.0/24 -j ACCEPT
+ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s 10.8.1.0/24 ! -d 10.8.1.0/24 -j SNAT --to $ip
+ExecStop=$iptables_path -w 5 -D INPUT -p tcp --dport 443 -j ACCEPT
+ExecStop=$iptables_path -w 5 -D FORWARD -s 10.8.1.0/24 -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
+			if [[ -n "$ip6" ]]; then
+				echo "ExecStart=$ip6tables_path -w 5 -t nat -A POSTROUTING -s fddd:1195:1195:1195::/64 ! -d fddd:1195:1195:1195::/64 -j SNAT --to $ip6
+ExecStart=$ip6tables_path -w 5 -I FORWARD -s fddd:1195:1195:1195::/64 -j ACCEPT
+ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:1195:1195:1195::/64 ! -d fddd:1195:1195:1195::/64 -j SNAT --to $ip6
+ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:1195:1195:1195::/64 -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
+			fi
+		fi
 		echo "RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target" >> /etc/systemd/system/openvpn-iptables.service
 		systemctl enable --now openvpn-iptables.service
 	fi
 	# If SELinux is enabled and a custom port was selected, we need this
-	if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 ]]; then
+	if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 || -n "$fallback" ]]; then
 		# Install semanage if not already present
 		if ! hash semanage 2>/dev/null; then
 				dnf install -y policycoreutils-python-utils
 		fi
-		semanage port -a -t openvpn_port_t -p "$protocol" "$port"
+		if [[ "$port" != 1194 ]]; then
+			# If the port is already defined in the base policy, modify it instead
+			semanage port -a -t openvpn_port_t -p "$protocol" "$port" 2>/dev/null || semanage port -m -t openvpn_port_t -p "$protocol" "$port"
+		fi
+		if [[ -n "$fallback" ]]; then
+			# 443 belongs to http_port_t in the base policy, so modify it
+			semanage port -a -t openvpn_port_t -p tcp 443 2>/dev/null || semanage port -m -t openvpn_port_t -p tcp 443
+			# Allow OpenVPN to open the loopback connection to the port-share decoy
+			setsebool -P openvpn_can_network_connect 1
+		fi
 	fi
 	# If the server is behind NAT, use the correct IP address
 	[[ -n "$public_ip" ]] && ip="$public_ip"
 	# client-common.txt is created so we have a template to add further users later
 	echo "client
 dev tun
-proto $protocol
-remote $ip $port
-resolv-retry infinite
+remote $ip $port $protocol" > /etc/openvpn/server/client-common.txt
+	if [[ -n "$fallback" ]]; then
+		# Fallback remote, tried automatically when the primary remote is unreachable
+		echo "remote $ip 443 tcp
+connect-timeout 10" >> /etc/openvpn/server/client-common.txt
+	fi
+	echo "resolv-retry infinite
 nobind
 persist-key
 persist-tun
 remote-cert-tls server
+verify-x509-name server name
 auth SHA512
 ignore-unknown-option block-outside-dns
-verb 3" > /etc/openvpn/server/client-common.txt
+verb 3" >> /etc/openvpn/server/client-common.txt
+	# Restart instances automatically if the daemon ever crashes
+	mkdir /etc/systemd/system/openvpn-server@.service.d/ 2>/dev/null
+	echo "[Service]
+Restart=on-failure
+RestartSec=5" > /etc/systemd/system/openvpn-server@.service.d/restart-on-failure.conf
+	systemctl daemon-reload
 	# Enable and start the OpenVPN service
 	systemctl enable --now openvpn-server@server.service
+	if [[ -n "$fallback" ]]; then
+		systemctl enable --now openvpn-server@server-tcp.service
+	fi
+	# Nightly maintenance restart during idle hours
+	# Instances with connected clients are skipped, so nobody gets disconnected
+	echo '#!/bin/bash
+for instance in server server-tcp; do
+	[[ -e /etc/openvpn/server/$instance.conf ]] || continue
+	# CLIENT_LIST lines are only present while clients are connected
+	grep -q "^CLIENT_LIST" /run/openvpn-server/status-$instance.log 2>/dev/null && continue
+	systemctl try-restart openvpn-server@$instance.service
+done' > /usr/local/sbin/openvpn-idle-restart
+	chmod 755 /usr/local/sbin/openvpn-idle-restart
+	echo "[Unit]
+Description=Restart idle OpenVPN server instances
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/openvpn-idle-restart" > /etc/systemd/system/openvpn-idle-restart.service
+	echo "[Unit]
+Description=Nightly restart of idle OpenVPN server instances
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=30min
+[Install]
+WantedBy=timers.target" > /etc/systemd/system/openvpn-idle-restart.timer
+	systemctl enable --now openvpn-idle-restart.timer
 	# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 	grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+	# Append the client's individual tls-crypt-v2 key
+	echo "<tls-crypt-v2>" >> "$script_dir"/"$client".ovpn
+	cat /etc/openvpn/server/easy-rsa/pki/private/"$client".tc-v2.key >> "$script_dir"/"$client".ovpn
+	echo "</tls-crypt-v2>" >> "$script_dir"/"$client".ovpn
+	# The .ovpn file contains the client private key, so restrict access to it
+	chmod 600 "$script_dir"/"$client".ovpn
 	echo
 	echo "Finished!"
 	echo
 	echo "The client configuration is available in:" "$script_dir"/"$client.ovpn"
+	if [[ -n "$fallback" ]]; then
+		echo "Clients will connect over $protocol $port and fall back to TCP 443 automatically."
+	fi
 	echo "New clients can be added by running this script again."
 else
 	clear
@@ -476,9 +650,17 @@ else
 				client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
 			done
 			cd /etc/openvpn/server/easy-rsa/
-			./easyrsa --batch --days=3650 build-client-full "$client" nopass
+			./easyrsa --batch --days=1095 build-client-full "$client" nopass
+			# Create an individual tls-crypt-v2 key for the new client
+			openvpn --tls-crypt-v2 /etc/openvpn/server/tc-v2.key --genkey tls-crypt-v2-client pki/private/"$client".tc-v2.key
 			# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+			# Append the client's individual tls-crypt-v2 key
+			echo "<tls-crypt-v2>" >> "$script_dir"/"$client".ovpn
+			cat /etc/openvpn/server/easy-rsa/pki/private/"$client".tc-v2.key >> "$script_dir"/"$client".ovpn
+			echo "</tls-crypt-v2>" >> "$script_dir"/"$client".ovpn
+			# The .ovpn file contains the client private key, so restrict access to it
+			chmod 600 "$script_dir"/"$client".ovpn
 			echo
 			echo "$client added. Configuration available in:" "$script_dir"/"$client.ovpn"
 			exit
@@ -514,6 +696,7 @@ else
 				rm -f /etc/openvpn/server/crl.pem
 				rm -f /etc/openvpn/server/easy-rsa/pki/reqs/"$client".req
 				rm -f /etc/openvpn/server/easy-rsa/pki/private/"$client".key
+				rm -f /etc/openvpn/server/easy-rsa/pki/private/"$client".tc-v2.key
 				cp /etc/openvpn/server/easy-rsa/pki/crl.pem /etc/openvpn/server/crl.pem
 				# CRL is read with each client connection, when OpenVPN is dropped to nobody
 				chown nobody:"$group_name" /etc/openvpn/server/crl.pem
@@ -551,16 +734,47 @@ else
 						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
 						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
 					fi
+					if [[ -e /etc/openvpn/server/server-tcp.conf ]]; then
+						firewall-cmd --remove-port=443/tcp
+						firewall-cmd --zone=trusted --remove-source=10.8.1.0/24
+						firewall-cmd --permanent --remove-port=443/tcp
+						firewall-cmd --permanent --zone=trusted --remove-source=10.8.1.0/24
+						firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.1.0/24 ! -d 10.8.1.0/24 -j SNAT --to "$ip"
+						firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.1.0/24 ! -d 10.8.1.0/24 -j SNAT --to "$ip"
+						if grep -qs "server-ipv6" /etc/openvpn/server/server-tcp.conf; then
+							firewall-cmd --zone=trusted --remove-source=fddd:1195:1195:1195::/64
+							firewall-cmd --permanent --zone=trusted --remove-source=fddd:1195:1195:1195::/64
+							firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1195:1195:1195::/64 ! -d fddd:1195:1195:1195::/64 -j SNAT --to "$ip6"
+							firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1195:1195:1195::/64 ! -d fddd:1195:1195:1195::/64 -j SNAT --to "$ip6"
+						fi
+					fi
 				else
 					systemctl disable --now openvpn-iptables.service
 					rm -f /etc/systemd/system/openvpn-iptables.service
 				fi
-				if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 ]]; then
-					semanage port -d -t openvpn_port_t -p "$protocol" "$port"
+				if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing"; then
+					if [[ "$port" != 1194 ]]; then
+						semanage port -d -t openvpn_port_t -p "$protocol" "$port"
+					fi
+					if [[ -e /etc/openvpn/server/server-tcp.conf ]]; then
+						semanage port -d -t openvpn_port_t -p tcp 443
+					fi
 				fi
 				systemctl disable --now openvpn-server@server.service
-				rm -f /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
+				if [[ -e /etc/openvpn/server/server-tcp.conf ]]; then
+					systemctl disable --now openvpn-server@server-tcp.service
+				fi
+				systemctl disable --now openvpn-idle-restart.timer
+				rm -f /etc/systemd/system/openvpn-idle-restart.timer /etc/systemd/system/openvpn-idle-restart.service /usr/local/sbin/openvpn-idle-restart
+				rm -f /etc/systemd/system/openvpn-server@.service.d/disable-limitnproc.conf
+				rm -f /etc/systemd/system/openvpn-server@.service.d/restart-on-failure.conf
 				rm -f /etc/sysctl.d/99-openvpn-forward.conf
+				# Remove the port-share decoy site (nginx itself is left installed)
+				if [[ -e /etc/nginx/conf.d/openvpn-decoy.conf ]]; then
+					rm -f /etc/nginx/conf.d/openvpn-decoy.conf
+					rm -rf /var/www/openvpn-decoy
+					systemctl reload nginx 2>/dev/null
+				fi
 				if [[ "$os" = "debian" || "$os" = "ubuntu" ]]; then
 					rm -rf /etc/openvpn/server
 					apt-get remove --purge -y openvpn
