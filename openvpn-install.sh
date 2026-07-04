@@ -463,23 +463,66 @@ push "rcvbuf 524288"' >> /etc/openvpn/server/server-udp.conf
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Welcome</title>
-<style>body{font-family:sans-serif;margin:3em auto;max-width:40em;padding:0 1em;color:#333}</style>
+<meta name="robots" content="noindex">
+<title>Northwind Studio</title>
+<style>
+:root{--bg:#0f1115;--fg:#e8eaed;--muted:#9aa0a6;--accent:#5b8def}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;display:flex;flex-direction:column}
+header,main,footer{width:100%;max-width:56rem;margin:0 auto;padding:1.5rem}
+header{display:flex;align-items:center;gap:.6rem}
+.logo{width:28px;height:28px}
+.brand{font-weight:600;letter-spacing:.02em}
+main{flex:1;display:flex;flex-direction:column;justify-content:center;gap:1.25rem}
+h1{font-size:clamp(1.8rem,5vw,3rem);line-height:1.1;margin:0}
+p.lead{color:var(--muted);font-size:1.1rem;max-width:34rem;margin:0}
+form{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}
+input{flex:1;min-width:14rem;padding:.7rem .9rem;border-radius:.5rem;border:1px solid #2a2f3a;background:#161a21;color:var(--fg)}
+button{padding:.7rem 1.1rem;border:0;border-radius:.5rem;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}
+footer{color:var(--muted);font-size:.85rem;border-top:1px solid #1c2029}
+</style>
 </head>
 <body>
-<h1>It works!</h1>
-<p>This is the default landing page for this server. If you are the site administrator, replace this file to publish your own content.</p>
+<header>
+<svg class="logo" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 2L2 7l10 5 10-5-10-5z" fill="#5b8def"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5" stroke="#5b8def" stroke-width="1.5" fill="none"/></svg>
+<span class="brand">Northwind Studio</span>
+</header>
+<main>
+<h1>Something new is on the way.</h1>
+<p class="lead">We are a small product studio building tools for teams. Our new site is almost ready &mdash; leave your email and we will let you know the moment we launch.</p>
+<form onsubmit="return false">
+<input type="email" placeholder="you@example.com" aria-label="Email address">
+<button type="submit">Notify me</button>
+</form>
+</main>
+<footer>&copy; Northwind Studio. All rights reserved.</footer>
 </body>
 </html>' > /var/www/openvpn-decoy/index.html
 		mkdir -p /etc/nginx/conf.d
+		# Drop the distro default vhost so our port 80 block is the only
+		# default_server (Debian ships one with default_server, which would
+		# otherwise collide and stop nginx from starting)
+		rm -f /etc/nginx/sites-enabled/default 2>/dev/null
 		if [[ -s /etc/openvpn/server/decoy/decoy.crt && -s /etc/openvpn/server/decoy/decoy.key ]]; then
 			# TLS decoy: an HTTPS probe to 443 completes a normal handshake and
-			# gets a real page, killing the "443 that does not speak TLS" tell
+			# gets a real page, killing the "443 that does not speak TLS" tell.
+			# Port 80 redirects to 443 so the host looks like a normal website
+			# that serves both ports. HTTP/2 + a modern cipher/ALPN profile make
+			# the decoy TLS fingerprint match an ordinary nginx site.
 			echo 'server {
-    listen 127.0.0.1:8080 ssl;
+    listen 80 default_server;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 127.0.0.1:8080 ssl http2;
     server_name _;
     ssl_certificate /etc/openvpn/server/decoy/decoy.crt;
     ssl_certificate_key /etc/openvpn/server/decoy/decoy.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:1m;
+    ssl_session_timeout 10m;
     root /var/www/openvpn-decoy;
     index index.html;
     # Serve the page even to a plain-HTTP request that lands on the TLS port
@@ -490,8 +533,17 @@ push "rcvbuf 524288"' >> /etc/openvpn/server/server-udp.conf
 }' > /etc/nginx/conf.d/openvpn-decoy.conf
 		else
 			# Cert generation failed for some reason: keep a plain-HTTP decoy so
-			# the port-share backend is still alive (a refused 443 is worse)
+			# the port-share backend is still alive (a refused 443 is worse).
+			# Serve the site directly on 80 (no TLS to redirect to here).
 			echo 'server {
+    listen 80 default_server;
+    root /var/www/openvpn-decoy;
+    index index.html;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+server {
     listen 127.0.0.1:8080;
     server_name _;
     root /var/www/openvpn-decoy;
@@ -575,6 +627,13 @@ net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.d/99-openvpn-forward.conf
 				firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to "$ip6"
 			fi
 		fi
+		# Open port 80 for the decoy web server so the host looks like a normal
+		# website serving both 80 (redirect) and 443. Needed with firewalld,
+		# which denies unlisted ports by default.
+		if [[ -n "$tcp443" ]]; then
+			firewall-cmd --add-port=80/tcp
+			firewall-cmd --permanent --add-port=80/tcp
+		fi
 	else
 		# Create a service to set up persistent iptables rules
 		iptables_path=$(command -v iptables)
@@ -633,6 +692,11 @@ ExecStart=$ip6tables_path -w 5 -I FORWARD -s fddd:1196:1196:1196::/64 -j ACCEPT
 ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to $ip6
 ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:1196:1196:1196::/64 -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
 			fi
+		fi
+		# Accept inbound HTTP on 80 for the decoy web server (redirect to 443)
+		if [[ -n "$tcp443" ]]; then
+			echo "ExecStart=$iptables_path -w 5 -I INPUT -p tcp --dport 80 -j ACCEPT
+ExecStop=$iptables_path -w 5 -D INPUT -p tcp --dport 80 -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
 		fi
 		echo "RemainAfterExit=yes
 [Install]
@@ -883,6 +947,12 @@ else
 							firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to "$ip6"
 							firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to "$ip6"
 						fi
+					fi
+					# Close the decoy HTTP port (only present if a TCP 443 decoy
+					# was set up, which is whenever nginx was installed)
+					if [[ -e /etc/nginx/conf.d/openvpn-decoy.conf ]]; then
+						firewall-cmd --remove-port=80/tcp
+						firewall-cmd --permanent --remove-port=80/tcp
 					fi
 				else
 					systemctl disable --now openvpn-iptables.service
