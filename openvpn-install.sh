@@ -173,9 +173,20 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 		fallback=""
 	else
 		fallback="y"
+	fi
+	# Also deploy a UDP 443 fallback instance (looks like QUIC / HTTP-3 to DPI)
+	# Many networks that block UDP 1194 still pass UDP 443, and it keeps UDP speed
+	# Skipped only when the primary instance is already UDP 443
+	if [[ "$protocol" = "udp" && "$port" = 443 ]]; then
+		fallback_udp=""
+	else
+		fallback_udp="y"
+	fi
+	if [[ -n "$fallback" || -n "$fallback_udp" ]]; then
 		echo
-		echo "A TCP 443 fallback instance will also be set up. Clients will use $protocol $port"
-		echo "and switch to TCP 443 automatically on networks where it is blocked."
+		echo "Extra fallback instances on port 443 will also be set up. Clients will use"
+		echo "$protocol $port first and switch to UDP 443 or TCP 443 automatically on"
+		echo "networks where the primary port is blocked."
 	fi
 	echo
 	echo "Select a DNS server for the clients:"
@@ -432,6 +443,20 @@ push "rcvbuf 524288"' >> /etc/openvpn/server/server.conf
 		# Hand non-OpenVPN traffic on 443 to the local decoy web server
 		echo 'port-share 127.0.0.1 8080' >> /etc/openvpn/server/server-tcp.conf
 	fi
+	# Create the UDP 443 fallback instance (QUIC-like camouflage), reusing the same
+	# PKI, DNS and routing options but on its own subnet
+	if [[ -n "$fallback_udp" ]]; then
+		sed 's|^port .*|port 443|; s|^proto .*|proto udp|; s|^server 10\.8\.0\.0 .*|server 10.8.2.0 255.255.255.0|; s|fddd:1194:1194:1194::|fddd:1196:1196:1196::|g; s|^ifconfig-pool-persist ipp\.txt|ifconfig-pool-persist ipp-udp.txt|; s|status-server\.log|status-server-udp.log|' /etc/openvpn/server/server.conf > /etc/openvpn/server/server-udp.conf
+		# When the primary is TCP, the UDP tuning block is absent, so add it here
+		if ! grep -q '^explicit-exit-notify' /etc/openvpn/server/server-udp.conf; then
+			echo 'explicit-exit-notify
+fast-io
+sndbuf 524288
+rcvbuf 524288
+push "sndbuf 524288"
+push "rcvbuf 524288"' >> /etc/openvpn/server/server-udp.conf
+		fi
+	fi
 	# Enable net.ipv4.ip_forward for the system
 	echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-openvpn-forward.conf
 	# Enable without waiting for a reboot or service restart
@@ -487,6 +512,20 @@ net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.d/99-openvpn-forward.conf
 				firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1195:1195:1195::/64 ! -d fddd:1195:1195:1195::/64 -j SNAT --to "$ip6"
 			fi
 		fi
+		if [[ -n "$fallback_udp" ]]; then
+			firewall-cmd --add-port=443/udp
+			firewall-cmd --zone=trusted --add-source=10.8.2.0/24
+			firewall-cmd --permanent --add-port=443/udp
+			firewall-cmd --permanent --zone=trusted --add-source=10.8.2.0/24
+			firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.2.0/24 ! -d 10.8.2.0/24 -j SNAT --to "$ip"
+			firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.2.0/24 ! -d 10.8.2.0/24 -j SNAT --to "$ip"
+			if [[ -n "$ip6" ]]; then
+				firewall-cmd --zone=trusted --add-source=fddd:1196:1196:1196::/64
+				firewall-cmd --permanent --zone=trusted --add-source=fddd:1196:1196:1196::/64
+				firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to "$ip6"
+				firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to "$ip6"
+			fi
+		fi
 	else
 		# Create a service to set up persistent iptables rules
 		iptables_path=$(command -v iptables)
@@ -532,13 +571,27 @@ ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:1195:1195:1195::/64 
 ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:1195:1195:1195::/64 -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
 			fi
 		fi
+		if [[ -n "$fallback_udp" ]]; then
+			echo "ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s 10.8.2.0/24 ! -d 10.8.2.0/24 -j SNAT --to $ip
+ExecStart=$iptables_path -w 5 -I INPUT -p udp --dport 443 -j ACCEPT
+ExecStart=$iptables_path -w 5 -I FORWARD -s 10.8.2.0/24 -j ACCEPT
+ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s 10.8.2.0/24 ! -d 10.8.2.0/24 -j SNAT --to $ip
+ExecStop=$iptables_path -w 5 -D INPUT -p udp --dport 443 -j ACCEPT
+ExecStop=$iptables_path -w 5 -D FORWARD -s 10.8.2.0/24 -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
+			if [[ -n "$ip6" ]]; then
+				echo "ExecStart=$ip6tables_path -w 5 -t nat -A POSTROUTING -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to $ip6
+ExecStart=$ip6tables_path -w 5 -I FORWARD -s fddd:1196:1196:1196::/64 -j ACCEPT
+ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to $ip6
+ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:1196:1196:1196::/64 -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
+			fi
+		fi
 		echo "RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target" >> /etc/systemd/system/openvpn-iptables.service
 		systemctl enable --now openvpn-iptables.service
 	fi
 	# If SELinux is enabled and a custom port was selected, we need this
-	if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 || -n "$fallback" ]]; then
+	if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 || -n "$fallback" || -n "$fallback_udp" ]]; then
 		# Install semanage if not already present
 		if ! hash semanage 2>/dev/null; then
 				dnf install -y policycoreutils-python-utils
@@ -553,6 +606,9 @@ WantedBy=multi-user.target" >> /etc/systemd/system/openvpn-iptables.service
 			# Allow OpenVPN to open the loopback connection to the port-share decoy
 			setsebool -P openvpn_can_network_connect 1
 		fi
+		if [[ -n "$fallback_udp" ]]; then
+			semanage port -a -t openvpn_port_t -p udp 443 2>/dev/null || semanage port -m -t openvpn_port_t -p udp 443
+		fi
 	fi
 	# If the server is behind NAT, use the correct IP address
 	[[ -n "$public_ip" ]] && ip="$public_ip"
@@ -560,10 +616,17 @@ WantedBy=multi-user.target" >> /etc/systemd/system/openvpn-iptables.service
 	echo "client
 dev tun
 remote $ip $port $protocol" > /etc/openvpn/server/client-common.txt
+	if [[ -n "$fallback_udp" ]]; then
+		# UDP 443 fallback (QUIC-like), tried before TCP for better speed
+		echo "remote $ip 443 udp" >> /etc/openvpn/server/client-common.txt
+	fi
 	if [[ -n "$fallback" ]]; then
-		# Fallback remote, tried automatically when the primary remote is unreachable
-		echo "remote $ip 443 tcp
-connect-timeout 10" >> /etc/openvpn/server/client-common.txt
+		# TCP 443 fallback, last resort for networks that block all UDP
+		echo "remote $ip 443 tcp" >> /etc/openvpn/server/client-common.txt
+	fi
+	if [[ -n "$fallback_udp" || -n "$fallback" ]]; then
+		# Move on to the next remote quickly when one is unreachable
+		echo "connect-timeout 10" >> /etc/openvpn/server/client-common.txt
 	fi
 	echo "resolv-retry infinite
 nobind
@@ -585,10 +648,13 @@ RestartSec=5" > /etc/systemd/system/openvpn-server@.service.d/restart-on-failure
 	if [[ -n "$fallback" ]]; then
 		systemctl enable --now openvpn-server@server-tcp.service
 	fi
+	if [[ -n "$fallback_udp" ]]; then
+		systemctl enable --now openvpn-server@server-udp.service
+	fi
 	# Nightly maintenance restart during idle hours
 	# Instances with connected clients are skipped, so nobody gets disconnected
 	echo '#!/bin/bash
-for instance in server server-tcp; do
+for instance in server server-tcp server-udp; do
 	[[ -e /etc/openvpn/server/$instance.conf ]] || continue
 	# CLIENT_LIST lines are only present while clients are connected
 	grep -q "^CLIENT_LIST" /run/openvpn-server/status-$instance.log 2>/dev/null && continue
@@ -620,8 +686,12 @@ WantedBy=timers.target" > /etc/systemd/system/openvpn-idle-restart.timer
 	echo "Finished!"
 	echo
 	echo "The client configuration is available in:" "$script_dir"/"$client.ovpn"
-	if [[ -n "$fallback" ]]; then
-		echo "Clients will connect over $protocol $port and fall back to TCP 443 automatically."
+	if [[ -n "$fallback_udp" || -n "$fallback" ]]; then
+		echo -n "Clients will connect over $protocol $port and fall back to"
+		[[ -n "$fallback_udp" ]] && echo -n " UDP 443"
+		[[ -n "$fallback_udp" && -n "$fallback" ]] && echo -n " then"
+		[[ -n "$fallback" ]] && echo -n " TCP 443"
+		echo " automatically."
 	fi
 	echo "New clients can be added by running this script again."
 else
@@ -748,6 +818,20 @@ else
 							firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1195:1195:1195::/64 ! -d fddd:1195:1195:1195::/64 -j SNAT --to "$ip6"
 						fi
 					fi
+					if [[ -e /etc/openvpn/server/server-udp.conf ]]; then
+						firewall-cmd --remove-port=443/udp
+						firewall-cmd --zone=trusted --remove-source=10.8.2.0/24
+						firewall-cmd --permanent --remove-port=443/udp
+						firewall-cmd --permanent --zone=trusted --remove-source=10.8.2.0/24
+						firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.2.0/24 ! -d 10.8.2.0/24 -j SNAT --to "$ip"
+						firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.2.0/24 ! -d 10.8.2.0/24 -j SNAT --to "$ip"
+						if grep -qs "server-ipv6" /etc/openvpn/server/server-udp.conf; then
+							firewall-cmd --zone=trusted --remove-source=fddd:1196:1196:1196::/64
+							firewall-cmd --permanent --zone=trusted --remove-source=fddd:1196:1196:1196::/64
+							firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to "$ip6"
+							firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1196:1196:1196::/64 ! -d fddd:1196:1196:1196::/64 -j SNAT --to "$ip6"
+						fi
+					fi
 				else
 					systemctl disable --now openvpn-iptables.service
 					rm -f /etc/systemd/system/openvpn-iptables.service
@@ -759,10 +843,16 @@ else
 					if [[ -e /etc/openvpn/server/server-tcp.conf ]]; then
 						semanage port -d -t openvpn_port_t -p tcp 443
 					fi
+					if [[ -e /etc/openvpn/server/server-udp.conf ]]; then
+						semanage port -d -t openvpn_port_t -p udp 443
+					fi
 				fi
 				systemctl disable --now openvpn-server@server.service
 				if [[ -e /etc/openvpn/server/server-tcp.conf ]]; then
 					systemctl disable --now openvpn-server@server-tcp.service
+				fi
+				if [[ -e /etc/openvpn/server/server-udp.conf ]]; then
+					systemctl disable --now openvpn-server@server-udp.service
 				fi
 				systemctl disable --now openvpn-idle-restart.timer
 				rm -f /etc/systemd/system/openvpn-idle-restart.timer /etc/systemd/system/openvpn-idle-restart.service /usr/local/sbin/openvpn-idle-restart

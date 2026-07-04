@@ -19,7 +19,11 @@ The generated `.ovpn` works as-is in the official clients on Windows, macOS, Lin
 ## What this fork adds
 
 ### Reaching restrictive networks
-- **Automatic TCP 443 fallback (always on).** Alongside the primary instance, a second OpenVPN instance is deployed on TCP 443 (its own `10.8.1.0/24` subnet). Every client profile ships with two `remote` lines, so the official client tries the primary protocol first and **falls back to TCP 443 automatically** (`connect-timeout 10`) on networks where UDP or custom ports are blocked. Skipped only when the primary instance is already TCP 443.
+- **Automatic port 443 fallbacks (always on).** Alongside the primary instance, up to two extra OpenVPN instances are deployed on port 443:
+  - **UDP 443** (subnet `10.8.2.0/24`) — looks like QUIC / HTTP-3 to DPI and keeps full UDP speed. Many networks that block UDP 1194 still pass UDP 443.
+  - **TCP 443** (subnet `10.8.1.0/24`) — last resort for networks that block all UDP.
+
+  Every client profile ships with multiple `remote` lines, so the official client tries the primary protocol first and **falls back to UDP 443, then TCP 443, automatically** (`connect-timeout 10`). Each 443 instance is skipped only when the primary instance already uses that exact protocol/port.
 - **`port-share` decoy against active probing.** The TCP 443 instance forwards any connection that is **not** a valid OpenVPN handshake to a local nginx serving a neutral landing page (`127.0.0.1:8080`). Probes and browsers hitting your `IP:443` see a real website instead of silence.
 
 ### Security
