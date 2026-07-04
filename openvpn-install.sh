@@ -160,12 +160,14 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	esac
 	echo
 	echo "What port should OpenVPN listen on?"
-	read -p "Port [1194]: " port
+	echo "Port 443 is recommended: it blends in with HTTPS/QUIC and avoids the"
+	echo "easily-blocked default 1194."
+	read -p "Port [443]: " port
 	until [[ -z "$port" || "$port" =~ ^[0-9]+$ && "$port" -le 65535 ]]; do
 		echo "$port: invalid port."
-		read -p "Port [1194]: " port
+		read -p "Port [443]: " port
 	done
-	[[ -z "$port" ]] && port="1194"
+	[[ -z "$port" ]] && port="443"
 	# Always deploy a TCP 443 fallback instance alongside the primary one
 	# Restrictive networks often block UDP, but rarely block TCP on port 443
 	# Skipped only when the primary instance is already TCP 443

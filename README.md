@@ -19,8 +19,9 @@ The generated `.ovpn` works as-is in the official clients on Windows, macOS, Lin
 ## What this fork adds
 
 ### Reaching restrictive networks
-- **Automatic port 443 fallbacks (always on).** Alongside the primary instance, up to two extra OpenVPN instances are deployed on port 443:
-  - **UDP 443** (subnet `10.8.2.0/24`) — looks like QUIC / HTTP-3 to DPI and keeps full UDP speed. Many networks that block UDP 1194 still pass UDP 443.
+- **Port 443 by default (no 1194).** The installer defaults to port **443** instead of the easily-blocked 1194, so the primary instance already blends in with HTTPS/QUIC. With the default UDP choice you get **UDP 443 as primary + TCP 443 as fallback** and no 1194 listener at all.
+- **Automatic port 443 fallbacks (always on).** Alongside the primary instance, the missing 443 variant is deployed automatically:
+  - **UDP 443** (subnet `10.8.2.0/24`) — looks like QUIC / HTTP-3 to DPI and keeps full UDP speed. Many networks that block other UDP ports still pass UDP 443.
   - **TCP 443** (subnet `10.8.1.0/24`) — last resort for networks that block all UDP.
 
   Every client profile ships with multiple `remote` lines, so the official client tries the primary protocol first and **falls back to UDP 443, then TCP 443, automatically** (`connect-timeout 10`). Each 443 instance is skipped only when the primary instance already uses that exact protocol/port.
@@ -50,7 +51,7 @@ Uninstalling through the menu cleanly removes every added component (timer, drop
 
 The anti-blocking features above (TCP 443 fallback, `port-share`, tls-crypt-v2) defeat port blocking and **active probing**, and remove OpenVPN's static protocol signature. They do **not** obfuscate the traffic's entropy.
 
-Advanced DPI systems (for example Russia's TSPU) can still block OpenVPN by analysing the entropy of the first packets, because the official client cannot be made to emit a genuine TLS ClientHello. Defeating that requires **client-side obfuscation** (Cloak/stunnel, AmneziaWG, XTLS-Reality, etc.), which needs software beyond the official OpenVPN client and is therefore out of scope for this fork.
+Advanced DPI systems (for example Russia's TSPU or Iran's filtering) can still block OpenVPN by its protocol signature and by analysing the entropy of the first packets, **regardless of the port used** — the official client cannot be made to emit a genuine TLS ClientHello. Defeating that requires **client-side obfuscation** (Cloak/stunnel, AmneziaWG, XTLS-Reality, Xray/VLESS/Trojan, obfuscated WireGuard, etc.), which needs software beyond the official OpenVPN client and is therefore out of scope for this fork.
 
 ## I want to run my own VPN but don't have a server
 
