@@ -19,13 +19,13 @@ The generated `.ovpn` works as-is in the official clients on Windows, macOS, Lin
 ## What this fork adds
 
 ### Reaching restrictive networks
-- **Port 443 by default (no 1194).** The installer defaults to port **443** instead of the easily-blocked 1194, so the primary instance already blends in with HTTPS/QUIC. With the default UDP choice you get **UDP 443 as primary + TCP 443 as fallback** and no 1194 listener at all.
+- **Port 443 by default (no 1194).** The installer defaults to port **443** instead of the easily-blocked 1194, so it rides the same port as HTTPS/QUIC and is rarely port-blocked. This is port-level blending, not protocol mimicry — the packets are still recognizably OpenVPN (see [Notes on censorship resistance](#notes-on-censorship-resistance)). With the default UDP choice you get **UDP 443 as primary + TCP 443 as fallback** and no 1194 listener at all.
 - **Automatic port 443 fallbacks (always on).** Alongside the primary instance, the missing 443 variant is deployed automatically:
-  - **UDP 443** (subnet `10.8.2.0/24`) — looks like QUIC / HTTP-3 to DPI and keeps full UDP speed. Many networks that block other UDP ports still pass UDP 443.
+  - **UDP 443** (subnet `10.8.2.0/24`) — shares the port with QUIC / HTTP-3 (but is still recognizable as OpenVPN to real DPI) and keeps full UDP speed. Many networks that block other UDP ports still pass UDP 443.
   - **TCP 443** (subnet `10.8.1.0/24`) — last resort for networks that block all UDP.
 
   Every client profile ships with multiple `remote` lines, so the official client tries the primary protocol first and **falls back to UDP 443, then TCP 443, automatically** (`connect-timeout 10`). Each 443 instance is skipped only when the primary instance already uses that exact protocol/port.
-- **`port-share` decoy against active probing.** The TCP 443 instance forwards any connection that is **not** a valid OpenVPN handshake to a local nginx serving a neutral landing page (`127.0.0.1:8080`). Probes and browsers hitting your `IP:443` see a real website instead of silence.
+- **`port-share` TLS decoy against active probing.** Whichever instance listens on TCP 443 forwards any connection that is **not** a valid OpenVPN handshake to a local nginx that **terminates TLS** (`127.0.0.1:8080`, self-signed cert). A probe or browser hitting your `IP:443` over HTTPS completes a normal TLS handshake and gets a neutral landing page — instead of silence or a port 443 that tellingly refuses to speak TLS.
 
 ### Security
 - **tls-crypt-v2** instead of tls-crypt v1: every client gets an **individual** control-channel key embedded in its `.ovpn`. A leaked client config no longer exposes a key shared by everyone, and the server stays silent to scans and invalid probes.
@@ -49,7 +49,7 @@ Uninstalling through the menu cleanly removes every added component (timer, drop
 
 ## Notes on censorship resistance
 
-The anti-blocking features above (TCP 443 fallback, `port-share`, tls-crypt-v2) defeat port blocking and **active probing**, and remove OpenVPN's static protocol signature. They do **not** obfuscate the traffic's entropy.
+The anti-blocking features above (TCP 443 fallback, `port-share`, tls-crypt-v2) defeat port blocking and **active probing**, and hide the TLS handshake inside the encrypted control channel. They do **not** obfuscate the protocol itself or the traffic's entropy.
 
 Advanced DPI systems (for example Russia's TSPU or Iran's filtering) can still block OpenVPN by its protocol signature and by analysing the entropy of the first packets, **regardless of the port used** — the official client cannot be made to emit a genuine TLS ClientHello. Defeating that requires **client-side obfuscation** (Cloak/stunnel, AmneziaWG, XTLS-Reality, Xray/VLESS/Trojan, obfuscated WireGuard, etc.), which needs software beyond the official OpenVPN client and is therefore out of scope for this fork.
 
